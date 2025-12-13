@@ -1,0 +1,15 @@
+[package]
+name = "lstm-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+burn = { version = "~0.19.1", features = ["std", "tui", "train", "vision", "wgpu", "fusion", "dataset", "autotune"], default-features = false}
+clap = { version = "4.5.53", features = ["default", "derive"]}
+csv = "1.4.0"
+serde = { version = "1.0.228", features = ["std", "derive"]}
+sonogram = "0.7.3"
+mel_spec_audio = "0.2.2"
+mel_spec = "0.3.3"
+log = "0.4.29"
+hound = "3.5.1"
