@@ -1,16 +1,14 @@
 use std::error::Error;
 use std::path::PathBuf;
-use std::result::Iter;
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::{Dataset, InMemDataset};
-use burn::data::dataset::transform::Windows;
 use burn::prelude::{Backend, ElementConversion, Int, TensorData};
 use burn::Tensor;
 use burn::tensor::DType;
 use hound::{SampleFormat, WavReader, WavSpec};
 use serde::Deserialize;
-use sonogram::{ColourGradient, ColourTheme, FrequencyScale, SonogramError, SpecCompute, SpecOptionsBuilder, Spectrogram};
-use log::{debug, error, info, warn};
+use sonogram::{ColourGradient, ColourTheme, FrequencyScale, SpecOptionsBuilder};
+use log::{debug, info, warn};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct UrbanSoundItem {
@@ -24,6 +22,9 @@ pub struct UrbanSoundItem {
     #[serde(rename = "classID")]
     pub class_id: i16,
     pub class: String,
+
+    #[serde(skip)]
+    pub full_path: Option<PathBuf>,
 }
 
 pub struct UrbanSoundDataset {
@@ -63,25 +64,6 @@ pub struct UrbanSoundBatcher {
 pub struct UrbanSoundBatch<B: Backend> {
     pub sonograms: Tensor<B, 3>,
     pub targets: Tensor<B, 1, Int>,
-}
-
-fn audio_to_floats(sample: &[u8]) -> Vec<f32> {
-    sample
-        .chunks_exact(2)
-        .map(|chunk| {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-            sample as f32 / i16::MAX as f32
-        })
-        .collect()
-}
-
-fn audio_to_shorts(sample: &[u8]) -> Vec<i16> {
-    sample
-        .chunks_exact(2)
-        .map(|chunk| {
-            i16::from_le_bytes([chunk[0], chunk[1]])
-        })
-        .collect()
 }
 
 fn wav_to_specs(bands: usize, frames: usize, wav_path: &PathBuf) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
@@ -305,7 +287,8 @@ impl<B: Backend> Batcher<B, UrbanSoundItem, UrbanSoundBatch<B>> for UrbanSoundBa
         let mut wavs: Vec<Tensor<B, 3>> = Vec::new();
         let mut targets: Vec<Tensor<B, 1, Int>> = Vec::new();
         for item in items {
-            let wav_path = self.dataset.join("audio").join(format!("fold{}", item.fold)).join(&item.slice_file_name);
+            let wav_path = item.full_path;
+            let wav_path = wav_path.or(Some(self.dataset.join("audio").join(format!("fold{}", item.fold)).join(&item.slice_file_name))).unwrap();
             let specs = wav_to_specs(self.bands, self.frames, &wav_path);
             match specs {
                 Ok(specs) => {

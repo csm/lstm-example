@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use burn::backend::{Autodiff, Wgpu};
 use burn::optim::AdamConfig;
 use clap::{Parser, Subcommand};
-use crate::model::LSTMConfig;
+use clap_verbosity_flag::Verbosity;
+use log::{debug, info, Level};
+use crate::model::{LSTMConfig, LSTMModel};
 use crate::train::{train, TrainingConfig};
 
 mod dataset;
@@ -16,7 +18,10 @@ type MyAutodiffBackend = Autodiff<MyBackend>;
 #[command(version, about, long_about = None)]
 struct Cli {
     #[clap(subcommand)]
-    command: Option<Commands>
+    command: Option<Commands>,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 #[derive(Subcommand, Debug)]
@@ -45,6 +50,16 @@ enum Commands {
 
         #[clap(long, default_value = "1")]
         num_layers: usize,
+    },
+    Predict {
+        #[clap(long, value_name = "PATH")]
+        file: PathBuf,
+
+        #[clap(long, default_value = "./data")]
+        checkpoint_dir: PathBuf,
+
+        #[clap(long)]
+        label: u16,
     }
 }
 
@@ -61,6 +76,16 @@ fn main() {
                 ),
                 device.clone(),
             )
+        }
+        Some(Commands::Predict { file, checkpoint_dir , label}) => {
+            env_logger::builder()
+                .filter_level(cli.verbosity.into())
+                .init();
+            info!("Predicting...");
+            let model = LSTMModel::<MyBackend>::load_checkpoint(checkpoint_dir, &device)
+                .expect("Failed to load checkpoint");
+            debug!("Model loaded");
+            model.infer(file, label, &device);
         }
         None => {
             println!("No command provided");
