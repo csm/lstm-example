@@ -1,20 +1,41 @@
+use std::fmt::format;
 use std::path::{Path, PathBuf};
-use burn::data::dataloader::DataLoaderBuilder;
+use std::sync::Arc;
+use burn::data::dataloader::{DataLoader, DataLoaderBuilder};
 use burn::optim::AdamConfig;
 use burn::prelude::{Config, Module};
 use burn::record::CompactRecorder;
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::{LearnerBuilder, LearningStrategy};
 use burn::train::metric::{AccuracyMetric, LossMetric};
+use either::{for_both, Either, Left, Right};
 use log::{debug, info};
-use crate::dataset::{UrbanSoundBatcher, UrbanSoundDataset};
-use crate::model::LSTMConfig;
+use crate::dataset::{UrbanSoundBatch, UrbanSoundBatcher, UrbanSoundDataset};
+use crate::model::{CNNConfig, LSTMConfig};
 
 #[derive(Config, Debug)]
 pub struct TrainingConfig {
     pub dataset: PathBuf,
     pub checkpoint_dir: PathBuf,
     pub model: LSTMConfig,
+    pub optimizer: AdamConfig,
+    #[config(default = 10)]
+    pub num_epochs: usize,
+    #[config(default = 10)]
+    pub batch_size: usize,
+    #[config(default = 4)]
+    pub num_workers: usize,
+    #[config(default = 42)]
+    pub seed: u64,
+    #[config(default = 1.0e-4)]
+    pub learning_rate: f64,
+}
+
+#[derive(Config, Debug)]
+pub struct CNNTrainingConfig {
+    pub dataset: PathBuf,
+    pub checkpoint_dir: PathBuf,
+    pub model: CNNConfig,
     pub optimizer: AdamConfig,
     #[config(default = 10)]
     pub num_epochs: usize,
@@ -39,52 +60,80 @@ pub fn train<B: AutodiffBackend>(
     checkpoint: PathBuf,
     frames: usize,
     bands: usize,
-    config: TrainingConfig,
+    config: Either<TrainingConfig, CNNTrainingConfig>,
     device: B::Device,
 ) {
     create_artifact_dir(&checkpoint);
     let checkpoint_dir = Path::new(&checkpoint).to_str().unwrap();
-    config.save(format!("{checkpoint_dir}/config.json"))
-        .expect("Failed to save config.json");
+    for_both!(&config, config => config.save(format!("{checkpoint_dir}/config.json"))
+        .expect("Failed to save config.json"));
 
-    B::seed(&device, config.seed);
+    B::seed(&device, for_both!(&config, config => config.seed));
 
     let batcher = UrbanSoundBatcher { frames, bands, dataset: dataset.clone() };
 
-    let dataloader_train = DataLoaderBuilder::new(batcher.clone())
-        .batch_size(config.batch_size)
-        .shuffle(config.seed)
-        .num_workers(config.num_workers)
+    let dataloader_train: Arc<dyn DataLoader<B, UrbanSoundBatch<B>>> = DataLoaderBuilder::new(batcher.clone())
+        .batch_size(for_both!(&config, config => config.batch_size))
+        .shuffle(for_both!(&config, config => config.seed))
+        .num_workers(for_both!(&config, config => config.num_workers))
         .build(UrbanSoundDataset::new(&dataset).unwrap());
 
     let dataloader_test = DataLoaderBuilder::new(batcher)
-        .batch_size(config.batch_size)
-        .shuffle(config.seed)
-        .num_workers(config.num_workers)
+        .batch_size(for_both!(&config, config => config.batch_size))
+        .shuffle(for_both!(&config, config => config.seed))
+        .num_workers(for_both!(&config, config => config.num_workers))
         .build(UrbanSoundDataset::new(&dataset).unwrap());
 
-    let model = config.model.init::<B>(&device);
+    let model = match &config {
+        Left(config) => Left(config.model.init(&device)),
+        Right(config) => Right(config.model.init(&device)),
+    };
     debug!("created model: {}", model);
-    let learner = LearnerBuilder::new(checkpoint_dir)
-        .metric_train_numeric(AccuracyMetric::new())
-        .metric_valid_numeric(AccuracyMetric::new())
-        .metric_train_numeric(LossMetric::new())
-        .metric_valid_numeric(LossMetric::new())
-        .with_file_checkpointer(CompactRecorder::new())
-        .learning_strategy(LearningStrategy::SingleDevice(device.clone()))
-        .num_epochs(config.num_epochs)
-        .summary()
-        .build(
-            model,
-            config.optimizer.init(),
-            config.learning_rate,
-        );
 
-    let result = learner.fit(dataloader_train, dataloader_test);
+    let learner = match model {
+        Left(model) => Left(LearnerBuilder::new(checkpoint_dir)
+            .metric_train_numeric(AccuracyMetric::new())
+            .metric_valid_numeric(AccuracyMetric::new())
+            .metric_train_numeric(LossMetric::new())
+            .metric_valid_numeric(LossMetric::new())
+            .with_file_checkpointer(CompactRecorder::new())
+            .learning_strategy(LearningStrategy::SingleDevice(device.clone()))
+            .num_epochs(for_both!(&config, config => config.num_epochs))
+            .summary()
+            .build(
+                model,
+                for_both!(&config, config => config.optimizer.init()),
+                for_both!(&config, config => config.learning_rate),
+        )),
+        Right(model) => Right(LearnerBuilder::new(checkpoint_dir)
+            .metric_train_numeric(AccuracyMetric::new())
+            .metric_valid_numeric(AccuracyMetric::new())
+            .metric_train_numeric(LossMetric::new())
+            .metric_valid_numeric(LossMetric::new())
+            .with_file_checkpointer(CompactRecorder::new())
+            .learning_strategy(LearningStrategy::SingleDevice(device.clone()))
+            .num_epochs(for_both!(&config, config => config.num_epochs))
+            .summary()
+            .build(
+                model,
+            for_both!(&config, config => config.optimizer.init()),
+            for_both!(&config, config => config.learning_rate),
+        )),
+    };
 
-    result
-        .model
-        .save_file(format!("{checkpoint_dir}/model"), &CompactRecorder::new())
-        .expect("Failed to save model");
+    let result = match learner {
+        Left(learner) => Left(learner.fit(dataloader_train, dataloader_test)),
+        Right(learner) => Right(learner.fit(dataloader_train, dataloader_test)),
+    };
 
+    match result {
+        Left(result) => result
+            .model
+            .save_file(format!("{checkpoint_dir}/model"), &CompactRecorder::new())
+            .expect("Failed to save model"),
+        Right(result) => result
+            .model
+            .save_file(format!("{checkpoint_dir}/model"), &CompactRecorder::new())
+            .expect("Failed to save model")
+    }
 }
