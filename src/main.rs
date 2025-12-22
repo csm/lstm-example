@@ -11,8 +11,8 @@ use clap_verbosity_flag::Verbosity;
 use either::{Left, Right};
 use log::{debug, info};
 use crate::dataset::{UrbanSoundBatch, UrbanSoundBatcher, UrbanSoundDataset};
-use crate::model::{CNNConfig, LSTMConfig, LSTMModel};
-use crate::train::{train, CNNTrainingConfig, TrainingConfig};
+use crate::model::{LSTMConfig, LSTMModel};
+use crate::train::{train, TrainingConfig};
 
 mod dataset;
 mod model;
@@ -52,7 +52,7 @@ enum Commands {
         #[clap(long, default_value = "10")]
         num_classes: usize,
 
-        #[clap(long, default_value = "5300")]
+        #[clap(long, default_value = "512")]
         hidden_size: usize,
 
         #[clap(long, default_value = "1")]
@@ -60,9 +60,6 @@ enum Commands {
 
         #[clap(long)]
         bidirectional: bool,
-
-        #[clap(long)]
-        use_cnn: bool,
     },
     Predict {
         #[clap(long, value_name = "PATH")]
@@ -113,25 +110,15 @@ fn main() {
     let cli = Cli::parse();
     let device = burn::backend::wgpu::WgpuDevice::default();
     match cli.command {
-        Some(Commands::Train { dataset, checkpoint_dir, frames, bands, num_features, num_classes, hidden_size, num_layers, bidirectional, use_cnn }) => {
-            if use_cnn {
-                train::<MyAutodiffBackend>(
-                    dataset.clone(), checkpoint_dir.clone(), frames, bands,
-                    Right(CNNTrainingConfig::new(dataset, checkpoint_dir,
-                                           CNNConfig::new(bands, frames, num_classes),
-                                           AdamConfig::new())),
-                    device.clone()
-                )
-            } else {
-                train::<MyAutodiffBackend>(
-                    dataset.clone(), checkpoint_dir.clone(), frames, bands,
-                    Left(TrainingConfig::new(dataset, checkpoint_dir,
-                                        LSTMConfig::new(bands, hidden_size, num_layers, num_classes).with_bidirectional(bidirectional),
-                                        AdamConfig::new(),
-                    )),
-                    device.clone(),
-                )
-            }
+        Some(Commands::Train { dataset, checkpoint_dir, frames, bands, num_features, num_classes, hidden_size, num_layers, bidirectional }) => {
+            train::<MyAutodiffBackend>(
+                dataset.clone(), checkpoint_dir.clone(), frames, bands,
+                TrainingConfig::new(dataset, checkpoint_dir,
+                                    LSTMConfig::new(bands, hidden_size, num_layers, num_classes).with_bidirectional(bidirectional),
+                                    AdamConfig::new(),
+                ),
+                device.clone(),
+            )
         }
         Some(Commands::Predict { file, checkpoint_dir , label}) => {
             env_logger::builder()

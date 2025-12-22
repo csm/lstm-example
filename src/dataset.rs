@@ -55,6 +55,165 @@ impl Dataset<UrbanSoundItem> for UrbanSoundDataset {
     }
 }
 
+// ============================================================================
+// Sequenced Dataset for Stateful LSTM
+// ============================================================================
+
+/// Represents a sequence of windows from a single audio file
+/// Used for stateful LSTM processing where LSTM state is maintained across windows
+#[derive(Clone, Debug)]
+pub struct SequencedUrbanSoundItem {
+    /// Audio file identifier
+    pub file_name: String,
+    /// Ordered spectrograms as raw bytes (one per window)
+    /// Each Vec<u8> is a grayscale spectrogram [bands × frames]
+    pub window_specs: Vec<Vec<u8>>,
+    /// Class label for this audio file
+    pub class_id: i16,
+    /// Number of windows in this sequence
+    pub num_windows: usize,
+}
+
+/// Dataset that groups windows by audio file for sequential LSTM processing
+#[derive(Clone)]
+pub struct UrbanSoundSequenceDataset {
+    pub path: PathBuf,
+    pub items: Vec<SequencedUrbanSoundItem>,
+}
+
+impl UrbanSoundSequenceDataset {
+    /// Create a new sequence dataset from the UrbanSound8K dataset
+    /// Groups all windows from each audio file into a single sequence item
+    pub fn new(path: &PathBuf, bands: usize) -> Result<Self, Box<dyn Error>> {
+        let base_dataset = UrbanSoundDataset::new(path)?;
+        let mut items = Vec::new();
+
+        info!("Loading UrbanSound8K dataset and grouping windows by file...");
+
+        // Process each audio file
+        for i in 0..base_dataset.len() {
+            if let Some(item) = base_dataset.get(i) {
+                let wav_path = item.full_path.clone().unwrap_or_else(|| {
+                    path.join("audio")
+                        .join(format!("fold{}", item.fold))
+                        .join(&item.slice_file_name)
+                });
+
+                // Generate all windows for this file
+                match wav_to_specs(bands, &wav_path) {
+                    Ok(window_specs) => {
+                        let num_windows = window_specs.len();
+                        if num_windows > 0 {
+                            let sequenced_item = SequencedUrbanSoundItem {
+                                file_name: item.slice_file_name.clone(),
+                                window_specs,
+                                class_id: item.class_id,
+                                num_windows,
+                            };
+                            items.push(sequenced_item);
+
+                            if (i + 1) % 100 == 0 {
+                                info!("Processed {}/{} files", i + 1, base_dataset.len());
+                            }
+                        } else {
+                            warn!("No windows generated for {:?}", wav_path);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Error loading windows for {:?}: {}", wav_path, e);
+                    }
+                }
+            }
+        }
+
+        info!("Loaded {} audio file sequences", items.len());
+
+        Ok(UrbanSoundSequenceDataset {
+            path: path.clone(),
+            items
+        })
+    }
+}
+
+impl Dataset<SequencedUrbanSoundItem> for UrbanSoundSequenceDataset {
+    fn get(&self, index: usize) -> Option<SequencedUrbanSoundItem> {
+        self.items.get(index).cloned()
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+// ============================================================================
+// Sequential Batcher for Stateful LSTM
+// ============================================================================
+
+/// Batch structure for sequential LSTM processing
+/// Each batch contains sequences of windows from audio files
+#[derive(Clone, Debug)]
+pub struct SequencedUrbanSoundBatch<B: Backend> {
+    /// Sequences of spectrograms
+    /// Each sequence is [num_windows, seq_len, features]
+    /// For batch_size=1: Vec contains 1 tensor
+    /// For batch_size>1: Vec contains multiple tensors (variable lengths)
+    pub sequences: Vec<Tensor<B, 3>>,
+    /// Target labels (one per sequence/file)
+    pub targets: Vec<i16>,
+}
+
+/// Batcher for sequenced urban sound data
+/// Converts grouped windows into tensors while preserving temporal ordering
+#[derive(Clone, Default)]
+pub struct SequencedUrbanSoundBatcher {
+    pub frames: usize,
+    pub bands: usize,
+}
+
+impl<B: Backend> Batcher<B, SequencedUrbanSoundItem, SequencedUrbanSoundBatch<B>> for SequencedUrbanSoundBatcher {
+    fn batch(&self, items: Vec<SequencedUrbanSoundItem>, device: &B::Device) -> SequencedUrbanSoundBatch<B> {
+        let mut sequences: Vec<Tensor<B, 3>> = Vec::new();
+        let mut targets: Vec<i16> = Vec::new();
+
+        for item in items {
+            let mut window_tensors: Vec<Tensor<B, 3>> = Vec::new();
+
+            // Convert each window spectrogram to a tensor
+            for spec_bytes in item.window_specs {
+                // Calculate natural width for 2-second window: (88200 - 2048) / 1024 + 1 ≈ 85
+                let window_samples = 2 * 44100;  // 2 seconds at 44100 Hz
+                let fft_size = 2048;
+                let hop_size = fft_size / 2;
+                let natural_width = ((window_samples - fft_size) / hop_size + 1).max(1);
+
+                // Grayscale spectrogram: [height, width] = [bands, natural_width]
+                let tensor_2d = Tensor::<B, 2>::from_data(
+                    TensorData::from_bytes_vec(spec_bytes, [self.bands, natural_width], DType::U8).convert::<f32>(),
+                    device
+                );
+
+                // Transpose to [width, height] = [natural_width, bands] for LSTM (time, freq)
+                let transposed = tensor_2d.swap_dims(0, 1);
+
+                // Reshape to [1, seq_len, features] = [1, natural_width, bands]
+                let tensor_3d = transposed.reshape([1, natural_width, self.bands]);
+                window_tensors.push(tensor_3d);
+            }
+
+            // Concatenate all windows along dimension 0: [num_windows, seq_len, features]
+            if !window_tensors.is_empty() {
+                let sequence = Tensor::cat(window_tensors, 0);
+                sequences.push(sequence);
+                targets.push(item.class_id);
+            } else {
+                warn!("Empty window sequence for file: {}", item.file_name);
+            }
+        }
+
+        SequencedUrbanSoundBatch { sequences, targets }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct UrbanSoundBatcher {
     pub frames: usize,
