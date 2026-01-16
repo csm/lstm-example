@@ -11,7 +11,7 @@ use burn::train::{LearnerBuilder, LearningStrategy};
 use burn::train::metric::{AccuracyMetric, LossMetric};
 use either::{for_both, Either, Left, Right};
 use log::{debug, info};
-use crate::dataset::{UrbanSoundBatch, UrbanSoundBatcher, UrbanSoundDataset, SequencedUrbanSoundBatch, SequencedUrbanSoundBatcher, UrbanSoundSequenceDataset};
+use crate::dataset::{UrbanSoundBatch, UrbanSoundBatcher, UrbanSoundDataset};
 use crate::model::{LSTMConfig};
 
 #[derive(Config, Debug)]
@@ -59,13 +59,13 @@ pub fn train<B: AutodiffBackend>(
         .batch_size(config.batch_size)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
-        .build(UrbanSoundDataset::new(&dataset).unwrap());
+        .build(UrbanSoundDataset::new(&dataset, bands).unwrap());
 
     let dataloader_test = DataLoaderBuilder::new(batcher)
         .batch_size(config.batch_size)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
-        .build(UrbanSoundDataset::new(&dataset).unwrap());
+        .build(UrbanSoundDataset::new(&dataset, bands).unwrap());
 
     let model = config.model.init(&device);
     debug!("created model: {}", model);

@@ -1,16 +1,24 @@
 use std::error::Error;
 use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataset::{Dataset, InMemDataset};
 use burn::prelude::{Backend, ElementConversion, Int, TensorData};
 use burn::Tensor;
 use burn::tensor::DType;
+use fon::Audio;
+use fon::chan::{Ch16, Ch32, Channel};
 use gif::{ColorOutput, DecodeOptions, Decoder, Encoder, Frame};
 use hound::{SampleFormat, WavReader, WavSpec};
 use serde::Deserialize;
 use sonogram::{ColourGradient, ColourTheme, FrequencyScale, SpecOptionsBuilder};
 use log::{debug, info, warn};
+use mel_spec::mel::interleave_frames;
+use mel_spec::prelude::{MelSpectrogram, Spectrogram};
+use mel_spec::quant::tga_8bit;
+use resampler::{ResamplerFft, SampleRate};
+use rubato::FftFixedIn;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct UrbanSoundItem {
@@ -32,22 +40,63 @@ pub struct UrbanSoundItem {
 pub struct UrbanSoundDataset {
     pub path: PathBuf,
     pub dataset: InMemDataset<UrbanSoundItem>,
+    pub bands: usize,
 }
 
 impl UrbanSoundDataset {
-    pub fn new(path: &PathBuf) -> Result<Self, std::io::Error> {
+    pub fn new(path: &PathBuf, bands: usize) -> Result<Self, std::io::Error> {
         let mut rdr = csv::ReaderBuilder::new();
         let rdr = rdr.delimiter(b',');
         let csv_path = path.join("metadata").join("UrbanSound8K.csv");
         let dataset = InMemDataset::from_csv(csv_path, rdr)?;
-        let dataset = UrbanSoundDataset { path: path.clone(), dataset };
+        let dataset = UrbanSoundDataset { path: path.clone(), dataset, bands };
         Ok(dataset)
     }
+}
+
+struct UrbanSoundSpecItem {
+    pub file_name: String,
+    pub spec: Vec<ndarray::Array2<f64>>,
+    pub class_id: i16,
 }
 
 impl Dataset<UrbanSoundItem> for UrbanSoundDataset {
     fn get(&self, index: usize) -> Option<UrbanSoundItem> {
         self.dataset.get(index)
+    }
+
+    fn len(&self) -> usize {
+        self.dataset.len()
+    }
+}
+
+impl Dataset<UrbanSoundSpecItem> for UrbanSoundDataset {
+    fn get(&self, index: usize) -> Option<UrbanSoundSpecItem> {
+        if let Some(item) = self.dataset.get(index) {
+            let path = if let Some(p) = item.full_path {
+                p.clone()
+            } else {
+                let mut full_path = self.path.clone();
+                full_path.push(item.slice_file_name);
+                full_path
+            };
+            let spec = wav_to_specs(self.bands, &path);
+            match spec {
+                Ok(spec) => Some(
+                    UrbanSoundSpecItem {
+                        file_name: "".to_string(),
+                        spec,
+                        class_id: item.class_id,
+                    }
+                ),
+                Err(e) => {
+                    info!("Error loading spec from {:?}: {:?}", path, e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
     }
 
     fn len(&self) -> usize {
@@ -65,13 +114,10 @@ impl Dataset<UrbanSoundItem> for UrbanSoundDataset {
 pub struct SequencedUrbanSoundItem {
     /// Audio file identifier
     pub file_name: String,
-    /// Ordered spectrograms as raw bytes (one per window)
-    /// Each Vec<u8> is a grayscale spectrogram [bands × frames]
-    pub window_specs: Vec<Vec<u8>>,
+    // Mel spectrogram
+    pub specs: Vec<ndarray::Array2<f64>>,
     /// Class label for this audio file
     pub class_id: i16,
-    /// Number of windows in this sequence
-    pub num_windows: usize,
 }
 
 /// Dataset that groups windows by audio file for sequential LSTM processing
@@ -79,139 +125,6 @@ pub struct SequencedUrbanSoundItem {
 pub struct UrbanSoundSequenceDataset {
     pub path: PathBuf,
     pub items: Vec<SequencedUrbanSoundItem>,
-}
-
-impl UrbanSoundSequenceDataset {
-    /// Create a new sequence dataset from the UrbanSound8K dataset
-    /// Groups all windows from each audio file into a single sequence item
-    pub fn new(path: &PathBuf, bands: usize) -> Result<Self, Box<dyn Error>> {
-        let base_dataset = UrbanSoundDataset::new(path)?;
-        let mut items = Vec::new();
-
-        info!("Loading UrbanSound8K dataset and grouping windows by file...");
-
-        // Process each audio file
-        for i in 0..base_dataset.len() {
-            if let Some(item) = base_dataset.get(i) {
-                let wav_path = item.full_path.clone().unwrap_or_else(|| {
-                    path.join("audio")
-                        .join(format!("fold{}", item.fold))
-                        .join(&item.slice_file_name)
-                });
-
-                // Generate all windows for this file
-                match wav_to_specs(bands, &wav_path) {
-                    Ok(window_specs) => {
-                        let num_windows = window_specs.len();
-                        if num_windows > 0 {
-                            let sequenced_item = SequencedUrbanSoundItem {
-                                file_name: item.slice_file_name.clone(),
-                                window_specs,
-                                class_id: item.class_id,
-                                num_windows,
-                            };
-                            items.push(sequenced_item);
-
-                            if (i + 1) % 100 == 0 {
-                                info!("Processed {}/{} files", i + 1, base_dataset.len());
-                            }
-                        } else {
-                            warn!("No windows generated for {:?}", wav_path);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Error loading windows for {:?}: {}", wav_path, e);
-                    }
-                }
-            }
-        }
-
-        info!("Loaded {} audio file sequences", items.len());
-
-        Ok(UrbanSoundSequenceDataset {
-            path: path.clone(),
-            items
-        })
-    }
-}
-
-impl Dataset<SequencedUrbanSoundItem> for UrbanSoundSequenceDataset {
-    fn get(&self, index: usize) -> Option<SequencedUrbanSoundItem> {
-        self.items.get(index).cloned()
-    }
-
-    fn len(&self) -> usize {
-        self.items.len()
-    }
-}
-
-// ============================================================================
-// Sequential Batcher for Stateful LSTM
-// ============================================================================
-
-/// Batch structure for sequential LSTM processing
-/// Each batch contains sequences of windows from audio files
-#[derive(Clone, Debug)]
-pub struct SequencedUrbanSoundBatch<B: Backend> {
-    /// Sequences of spectrograms
-    /// Each sequence is [num_windows, seq_len, features]
-    /// For batch_size=1: Vec contains 1 tensor
-    /// For batch_size>1: Vec contains multiple tensors (variable lengths)
-    pub sequences: Vec<Tensor<B, 3>>,
-    /// Target labels (one per sequence/file)
-    pub targets: Vec<i16>,
-}
-
-/// Batcher for sequenced urban sound data
-/// Converts grouped windows into tensors while preserving temporal ordering
-#[derive(Clone, Default)]
-pub struct SequencedUrbanSoundBatcher {
-    pub frames: usize,
-    pub bands: usize,
-}
-
-impl<B: Backend> Batcher<B, SequencedUrbanSoundItem, SequencedUrbanSoundBatch<B>> for SequencedUrbanSoundBatcher {
-    fn batch(&self, items: Vec<SequencedUrbanSoundItem>, device: &B::Device) -> SequencedUrbanSoundBatch<B> {
-        let mut sequences: Vec<Tensor<B, 3>> = Vec::new();
-        let mut targets: Vec<i16> = Vec::new();
-
-        for item in items {
-            let mut window_tensors: Vec<Tensor<B, 3>> = Vec::new();
-
-            // Convert each window spectrogram to a tensor
-            for spec_bytes in item.window_specs {
-                // Calculate natural width for 2-second window: (88200 - 2048) / 1024 + 1 ≈ 85
-                let window_samples = 2 * 44100;  // 2 seconds at 44100 Hz
-                let fft_size = 2048;
-                let hop_size = fft_size / 2;
-                let natural_width = ((window_samples - fft_size) / hop_size + 1).max(1);
-
-                // Grayscale spectrogram: [height, width] = [bands, natural_width]
-                let tensor_2d = Tensor::<B, 2>::from_data(
-                    TensorData::from_bytes_vec(spec_bytes, [self.bands, natural_width], DType::U8).convert::<f32>(),
-                    device
-                );
-
-                // Transpose to [width, height] = [natural_width, bands] for LSTM (time, freq)
-                let transposed = tensor_2d.swap_dims(0, 1);
-
-                // Reshape to [1, seq_len, features] = [1, natural_width, bands]
-                let tensor_3d = transposed.reshape([1, natural_width, self.bands]);
-                window_tensors.push(tensor_3d);
-            }
-
-            // Concatenate all windows along dimension 0: [num_windows, seq_len, features]
-            if !window_tensors.is_empty() {
-                let sequence = Tensor::cat(window_tensors, 0);
-                sequences.push(sequence);
-                targets.push(item.class_id);
-            } else {
-                warn!("Empty window sequence for file: {}", item.file_name);
-            }
-        }
-
-        SequencedUrbanSoundBatch { sequences, targets }
-    }
 }
 
 #[derive(Clone, Default)]
@@ -242,89 +155,50 @@ fn read_gif_file(path: &PathBuf) -> Result<Vec<u8>, std::io::Error> {
 fn wav_to_specs(bands: usize, wav_path: &PathBuf) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
     let handle = File::open(wav_path)
         .map_err(|e| format!("Failed to open {:?}: {}", wav_path, e))?;
-    debug!("opened handle {:?}", handle);
     let mut wav = WavReader::new(handle)
         .map_err(|e| format!("Failed to read WAV {:?}: {}", wav_path, e))?;
     let spec = wav.spec();
     info!("read wav {:?}: channels={}, sample_rate={}, bits={}, format={:?}",
            wav_path.file_name().unwrap_or_default(), spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format);
-    let out_spec = WavSpec {
-        channels: 1,
-        sample_rate: 44100,
-        bits_per_sample: 16,
-        sample_format: SampleFormat::Int,
-    };
 
-    // Read all samples from the WAV file and convert to i16
-    // Handle different bit depths
-    let samples: Vec<i16> = resample_audio(wav_path, &mut wav, spec)?;
-    debug!("samples {:?}", samples.len());
+    let mels_path = wav_path.with_extension("mel");
+    if mels_path.exists() && mels_path.is_dir() {
+        // load precomputed mels from tga chunks.
 
-    // Convert to mono and resample in one pass if needed
-    let resampled_samples = convent_to_mono(spec, out_spec, samples);
-
-    // Calculate window and step sizes in samples (using output sample rate)
-    let window_duration_secs = 2;
-    let step_duration_secs = 1;
-    let window_size = window_duration_secs * out_spec.sample_rate as usize;
-    let step_size = step_duration_secs * out_spec.sample_rate as usize;
-
-    debug!("resampling/conversion done; window size {}, step size {}", window_size, step_size);
-
-    // Pad short audio files with silence to reach minimum window size
-    let resampled_samples = if resampled_samples.len() < window_size {
-        debug!("padding audio from {} to {} samples", resampled_samples.len(), window_size);
-        let mut padded = resampled_samples;
-        padded.resize(window_size, 0);
-        padded
-    } else {
-        resampled_samples
-    };
-
-    let mut result = Vec::new();
-    let mut gradient = ColourGradient::create(ColourTheme::Default);
-
-    // Iterate over 2-second windows with 1-second offset
-    let mut offset = 0;
-    while offset + window_size <= resampled_samples.len() {
-        let precomputed_path = wav_path.with_added_extension(format!("precomputed_{}_{}.gif", window_size, offset));
-        debug!("pulling out window [{}..{}] of {}", offset, offset + window_size, resampled_samples.len());
-        let window_samples = &resampled_samples[offset..offset + window_size];
-
-        debug!("creating sonogram at offset {}, window_samples len: {}, bands: {}", offset, window_samples.len(), bands);
-
-        // Create spectrogram from the window
-        debug!("loading data from memory...");
-
-        let gif_path = if precomputed_path.exists() {
-            Some(precomputed_path.clone())
-        } else {
-            None
-        };
-
-        let grayscale_bytes = match gif_path {
-            Some(path) => {
-                info!("loading sonogram data from file {}", path.display());
-                read_gif_file(&path)?
-            }
-            None => {
-                info!("generating sonogram data for file {}", wav_path.display());
-                let (spec, width, height) = sample_to_spectrogram(bands, wav_path, out_spec, &mut gradient, offset, window_samples)?;
-                // Save the computed spectrogram
-                let file = File::create(precomputed_path)?;
-                let mut encoder = Encoder::new(file, width as u16, height as u16, &[0xff, 0xff, 0xff, 0, 0, 0])?;
-                let frame = Frame::from_indexed_pixels(width as u16, height as u16, spec.clone(), None);
-                encoder.write_frame(&frame)?;
-                spec
-            }
-        };
-
-        debug!("converted to grayscale, len: {}", grayscale_bytes.len());
-        result.push(grayscale_bytes);
-        offset += step_size;
     }
 
-    Ok(result)
+    // Parameterize these?
+    let fft_size = 400;
+    let hop_size = 100;
+    let sample_rate = spec.sample_rate as f64;
+
+    let mut stft = Spectrogram::new(fft_size, hop_size);
+    let mut mel = MelSpectrogram::new(fft_size, sample_rate, bands);
+
+    let samples: Box<dyn Iterator<Item=Result<f32, _>>> = match spec.sample_format {
+        SampleFormat::Float => Box::new(wav.samples::<f32>()),
+        SampleFormat::Int => Box::new(wav.samples::<i32>().map(|i| i.map(|i| i as f32))),
+    };
+
+    let mut mel_frames: Vec<ndarray::Array2<f64>> = Vec::new();
+
+    for sample in samples {
+        let sample = sample?;
+        let buf = [sample];
+        if let Some(fft_frame) = stft.add(&buf) {
+            let mel_frame = mel.add(&fft_frame);
+            mel_frames.push(mel_frame);
+        }
+    }
+    let interleaved = interleave_frames(mel_frames.as_slice(), false, 100);
+    let tgas = tga_8bit(interleaved.as_slice(), bands);
+    for (i, tga) in tgas.iter().enumerate() {
+        let mut path = mels_path.clone();
+        path.push(format!("chunk_{}.tga", i));
+        let mut file = File::create(path)?;
+        file.write_all(tga.as_slice())?;
+    }
+    Ok(tgas)
 }
 
 fn sample_to_spectrogram(
@@ -383,6 +257,50 @@ fn sample_to_spectrogram(
         })
         .collect();
     Ok((grayscale_bytes, natural_width, height))
+}
+
+fn to_u8(v: Vec<i16>) -> Vec<u8> {
+    v.iter().flat_map(|x| vec![(x >> 8) as u8, (x & 0xff) as u8]).collect()
+}
+
+fn to_f32(v: Vec<i16>) -> Vec<f32> {
+    v.chunks_exact(2).map(|v| f32::from_bits(((v[0] as u32) << 16) | (v[1] as u32))).collect()
+}
+
+fn to_f64(v: Vec<i16>) -> Vec<f64> {
+    v.chunks_exact(4).map(|v| f64::from_bits(
+        ((v[0] as u64) << 48) |
+            ((v[1] as u64) << 32) |
+            ((v[2] as u64) << 16) |
+            (v[3] as u64)
+    )).collect()
+}
+
+fn resample_wav<Chan: Channel, const CH: usize, B>(
+    spec: WavSpec, wav: &mut WavReader<File>
+) -> Result<Vec<i16>, Box<dyn Error>>
+    where B: Into<Box<[fon::Frame<Chan, CH>]>> {
+    let channels = spec.channels as usize;
+    let in_hz = hz_to_sample_rate(spec)?;
+    let mut resampler = FftFixedIn::new(spec.sample_rate as usize,
+                                        41_000, 1024, 1, channels)?;
+
+}
+
+fn hz_to_sample_rate(spec: WavSpec) -> Result<SampleRate, Box<dyn Error>> {
+    match spec.sample_rate {
+        16_000 => Ok(SampleRate::Hz16000),
+        22_050 => Ok(SampleRate::Hz22050),
+        32_000 => Ok(SampleRate::Hz32000),
+        44_100 => Ok(SampleRate::Hz44100),
+        48_000 => Ok(SampleRate::Hz48000),
+        88_200 => Ok(SampleRate::Hz88200),
+        96_000 => Ok(SampleRate::Hz96000),
+        176_400 => Ok(SampleRate::Hz176400),
+        192_000 => Ok(SampleRate::Hz192000),
+        384_000 => Ok(SampleRate::Hz384000),
+        _ => Err(format!("Unsupported sample rate: {}", spec.sample_rate).into())
+    }
 }
 
 // This function was AI-generated; it should be reviewed.

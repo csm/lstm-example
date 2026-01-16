@@ -87,7 +87,7 @@ enum Commands {
 }
 
 fn precompute<B: Backend>(dataset: PathBuf, frames: usize, bands: usize, batch_size: usize, device: &B::Device) {
-    let mem_dataset = UrbanSoundDataset::new(&dataset).expect("Failed to read dataset metadata");
+    let mem_dataset = UrbanSoundDataset::new(&dataset, bands).expect("Failed to read dataset metadata");
     let batcher = UrbanSoundBatcher {
         frames,
         bands,
