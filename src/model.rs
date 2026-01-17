@@ -11,7 +11,7 @@ use burn::Tensor;
 use burn::tensor::backend::AutodiffBackend;
 use burn::train::{ClassificationOutput, TrainOutput, TrainStep, ValidStep};
 use log::info;
-use crate::dataset::{UrbanSoundBatch, UrbanSoundBatcher, UrbanSoundItem, SequencedUrbanSoundBatch, SequencedUrbanSoundBatcher};
+use crate::dataset::{UrbanSoundBatch, UrbanSoundBatcher, UrbanSoundItem};
 use crate::train::TrainingConfig;
 
 #[derive(Config, Debug)]
