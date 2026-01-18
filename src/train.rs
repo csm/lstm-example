@@ -11,7 +11,7 @@ use burn::train::{LearnerBuilder, LearningStrategy};
 use burn::train::metric::{AccuracyMetric, LossMetric};
 use either::{for_both, Either, Left, Right};
 use log::{debug, info};
-use crate::dataset::{UrbanSoundBatch, UrbanSoundBatcher, UrbanSoundDataset, SequencedUrbanSoundBatch, SequencedUrbanSoundBatcher, UrbanSoundSequenceDataset};
+use crate::dataset::{UrbanSoundBatch, UrbanSoundBatcher, UrbanSoundDataset};
 use crate::model::{LSTMConfig};
 
 #[derive(Config, Debug)]
@@ -43,6 +43,8 @@ pub fn train<B: AutodiffBackend>(
     checkpoint: PathBuf,
     frames: usize,
     bands: usize,
+    window_secs: f32,
+    step_by_secs: f32,
     config: TrainingConfig,
     device: B::Device,
 ) {
@@ -53,19 +55,25 @@ pub fn train<B: AutodiffBackend>(
 
     B::seed(&device, config.seed);
 
-    let batcher = UrbanSoundBatcher { frames, bands, dataset: dataset.clone() };
+    let batcher = UrbanSoundBatcher {
+        frames,
+        bands,
+        dataset: dataset.clone(),
+        window_secs,
+        step_by_secs,
+    };
 
     let dataloader_train: Arc<dyn DataLoader<B, UrbanSoundBatch<B>>> = DataLoaderBuilder::new(batcher.clone())
         .batch_size(config.batch_size)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
-        .build(UrbanSoundDataset::new(&dataset).unwrap());
+        .build(UrbanSoundDataset::new(&dataset, bands).unwrap());
 
     let dataloader_test = DataLoaderBuilder::new(batcher)
         .batch_size(config.batch_size)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
-        .build(UrbanSoundDataset::new(&dataset).unwrap());
+        .build(UrbanSoundDataset::new(&dataset, bands).unwrap());
 
     let model = config.model.init(&device);
     debug!("created model: {}", model);
