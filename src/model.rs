@@ -132,11 +132,20 @@ impl<B: Backend> LSTMModel<B> {
         Ok(config.model.init(device).load_record(record))
     }
 
-    pub fn infer(&self, file: PathBuf, label: u16, device: &B::Device) {
+    pub fn infer(
+        &self,
+        file: PathBuf,
+        label: u16,
+        window_secs: f32,
+        step_by_secs: f32,
+        device: &B::Device
+    ) {
         let batcher = UrbanSoundBatcher {
             frames: 41,
             bands: 60,
             dataset: file.parent().unwrap().to_owned(),
+            window_secs,
+            step_by_secs,
         };
         let batch = batcher.batch(vec![UrbanSoundItem {
             slice_file_name: file.iter().last().unwrap().to_str().unwrap().to_string(),

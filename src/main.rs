@@ -60,6 +60,12 @@ enum Commands {
 
         #[clap(long)]
         bidirectional: bool,
+
+        #[clap(long, default_value = "2.0")]
+        window_secs: f32,
+
+        #[clap(long, default_value = "0.5")]
+        step_by_secs: f32,
     },
     Predict {
         #[clap(long, value_name = "PATH")]
@@ -70,6 +76,12 @@ enum Commands {
 
         #[clap(long)]
         label: u16,
+
+        #[clap(long, default_value = "2.0")]
+        window_secs: f32,
+
+        #[clap(long, default_value = "0.5")]
+        step_by_secs: f32,
     },
     Precompute {
         #[clap(long, value_name = "PATH")]
@@ -83,15 +95,31 @@ enum Commands {
 
         #[clap(long, default_value = "10")]
         batch_size: usize,
+
+        #[clap(long, default_value = "2.0")]
+        window_secs: f32,
+
+        #[clap(long, default_value = "0.5")]
+        step_by_secs: f32,
     }
 }
 
-fn precompute<B: Backend>(dataset: PathBuf, frames: usize, bands: usize, batch_size: usize, device: &B::Device) {
+fn precompute<B: Backend>(
+    dataset: PathBuf,
+    frames: usize,
+    bands: usize,
+    batch_size: usize,
+    window_secs: f32,
+    step_by_secs: f32,
+    device: &B::Device
+) {
     let mem_dataset = UrbanSoundDataset::new(&dataset, bands).expect("Failed to read dataset metadata");
     let batcher = UrbanSoundBatcher {
         frames,
         bands,
         dataset,
+        window_secs,
+        step_by_secs,
     };
     let mut items = Vec::new();
     for i in 0..mem_dataset.dataset.len() {
@@ -110,9 +138,9 @@ fn main() {
     let cli = Cli::parse();
     let device = burn::backend::wgpu::WgpuDevice::default();
     match cli.command {
-        Some(Commands::Train { dataset, checkpoint_dir, frames, bands, num_features, num_classes, hidden_size, num_layers, bidirectional }) => {
+        Some(Commands::Train { dataset, checkpoint_dir, frames, bands, num_features, num_classes, hidden_size, num_layers, bidirectional, window_secs, step_by_secs }) => {
             train::<MyAutodiffBackend>(
-                dataset.clone(), checkpoint_dir.clone(), frames, bands,
+                dataset.clone(), checkpoint_dir.clone(), frames, bands, window_secs, step_by_secs,
                 TrainingConfig::new(dataset, checkpoint_dir,
                                     LSTMConfig::new(bands, hidden_size, num_layers, num_classes).with_bidirectional(bidirectional),
                                     AdamConfig::new(),
@@ -120,7 +148,7 @@ fn main() {
                 device.clone(),
             )
         }
-        Some(Commands::Predict { file, checkpoint_dir , label}) => {
+        Some(Commands::Predict { file, checkpoint_dir , label, window_secs, step_by_secs }) => {
             env_logger::builder()
                 .filter_level(cli.verbosity.into())
                 .init();
@@ -128,13 +156,13 @@ fn main() {
             let model = LSTMModel::<MyBackend>::load_checkpoint(checkpoint_dir, &device)
                 .expect("Failed to load checkpoint");
             debug!("Model loaded");
-            model.infer(file, label, &device);
+            model.infer(file, label, window_secs, step_by_secs, &device);
         }
-        Some(Commands::Precompute { dataset, frames, bands, batch_size }) => {
+        Some(Commands::Precompute { dataset, frames, bands, batch_size , window_secs, step_by_secs }) => {
             env_logger::builder()
                 .filter_level(cli.verbosity.into())
                 .init();
-            precompute::<MyBackend>(dataset, frames, bands, batch_size, &device);
+            precompute::<MyBackend>(dataset, frames, bands, batch_size, window_secs, step_by_secs, &device);
         }
         None => {
             println!("No command provided");

@@ -43,6 +43,8 @@ pub fn train<B: AutodiffBackend>(
     checkpoint: PathBuf,
     frames: usize,
     bands: usize,
+    window_secs: f32,
+    step_by_secs: f32,
     config: TrainingConfig,
     device: B::Device,
 ) {
@@ -53,7 +55,13 @@ pub fn train<B: AutodiffBackend>(
 
     B::seed(&device, config.seed);
 
-    let batcher = UrbanSoundBatcher { frames, bands, dataset: dataset.clone() };
+    let batcher = UrbanSoundBatcher {
+        frames,
+        bands,
+        dataset: dataset.clone(),
+        window_secs,
+        step_by_secs,
+    };
 
     let dataloader_train: Arc<dyn DataLoader<B, UrbanSoundBatch<B>>> = DataLoaderBuilder::new(batcher.clone())
         .batch_size(config.batch_size)
